@@ -177,7 +177,11 @@ fn run_viewer(mut ws: WebSocket<TcpStream>, hub: &Hub, injector: &Injector, same
         }
 
         match ws.read() {
-            Ok(Message::Text(text)) => handle_text(hub, injector, text.as_str(), same_pc, id),
+            Ok(Message::Text(text)) => {
+                if let Some(reply) = handle_text(hub, injector, text.as_str(), same_pc, id) {
+                    let _ = ws.send(Message::Text(reply.into()));
+                }
+            }
             Ok(Message::Close(_)) => break "closed by viewer",
             Ok(_) => {}
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -221,25 +225,40 @@ fn pack(frame: &EncodedFrame) -> Vec<u8> {
     out
 }
 
-fn handle_text(hub: &Hub, injector: &Injector, text: &str, same_pc: bool, id: u64) {
+/// Handle one text message from the viewer. Returns a reply to send back, if any.
+fn handle_text(hub: &Hub, injector: &Injector, text: &str, same_pc: bool, id: u64) -> Option<String> {
     if text.contains("\"t\":\"keyframe\"") {
         hub.request_keyframe();
-        return;
+        return None;
     }
     let msg: InputMsg = match serde_json::from_str(text) {
         Ok(msg) => msg,
         Err(e) => {
             eprintln!("[viewer {id}] bad message: {e}");
-            return;
+            return None;
         }
     };
     // A viewer on this PC: its hover moves would drag the local cursor onto the Claude window.
     if same_pc && matches!(msg, InputMsg::Move { .. }) {
-        return;
+        return None;
     }
-    // Moves are too frequent to log; typed text is the user's prompt, so log only its length.
+    // The viewer shows the host's IME state, so tell it what the toggle did.
+    if matches!(msg, InputMsg::ImeToggle) {
+        return match injector.toggle_ime() {
+            Ok(on) => {
+                println!("[viewer {id}] IME {}", if on { "on" } else { "off" });
+                Some(format!("{{\"t\":\"ime\",\"on\":{on}}}"))
+            }
+            Err(why) => {
+                eprintln!("[viewer {id}] IME toggle failed ({why})");
+                Some("{\"t\":\"ime\",\"error\":true}".into())
+            }
+        };
+    }
+    // Moves are too frequent to log. Typed characters and text are the user's prompt, so log
+    // nothing of them but the length.
     let summary = match &msg {
-        InputMsg::Move { .. } => None,
+        InputMsg::Move { .. } | InputMsg::Type { .. } => None,
         InputMsg::Text { s } => Some(format!("Text ({} chars)", s.chars().count())),
         other => Some(format!("{other:?}")),
     };
@@ -247,6 +266,8 @@ fn handle_text(hub: &Hub, injector: &Injector, text: &str, same_pc: bool, id: u6
     match (result, summary) {
         (Ok(()), Some(s)) => println!("[viewer {id}] input {s}"),
         (Err(why), Some(s)) => eprintln!("[viewer {id}] input dropped ({why}): {s}"),
+        (Err(why), None) => eprintln!("[viewer {id}] input dropped ({why})"),
         _ => {}
     }
+    None
 }

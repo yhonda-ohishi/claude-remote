@@ -25,7 +25,7 @@
 <div id="hud">接続中…</div>
 <div id="bar">
   <div class="row">
-    <input id="text" placeholder="ここに入力して「送信」（日本語はこの欄で確定）" autocomplete="off">
+    <input id="text" placeholder="まとめて送る文字（画面をクリックして 半角/全角 で直接打つこともできる）" autocomplete="off">
     <button id="sendText">送信</button>
   </div>
   <div class="row">
@@ -34,6 +34,7 @@
     <button data-key="Escape">Esc</button>
     <button data-key="Tab">Tab</button>
     <button data-key="Backspace">⌫</button>
+    <button id="imeBtn" title="ホスト側の IME を切り替える（半角/全角キーと同じ）">あ/A</button>
     <span class="spacer"></span>
     <button id="reconnect">再接続</button>
   </div>
@@ -48,6 +49,7 @@ const hud = document.getElementById('hud');
 // Video messages: [1][keyframe u8][captured unix ms f64 LE][H.264 Annex B].
 
 let ws, decoder, configured = false, state = '接続中', retryMs = 1000, retryTimer;
+let hostIme = '-';  // the host's IME as last reported: 'あ' (on), 'A' (off), '-' (unknown)
 let stats = { frames: 0, bytes: 0, since: performance.now() }, latencies = [];
 
 function connect() {
@@ -58,7 +60,11 @@ function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { setState('接続済み'); retryMs = 1000; };
-  ws.onmessage = e => { if (e.data instanceof ArrayBuffer) onVideo(e.data); };
+  ws.onmessage = e => {
+    if (e.data instanceof ArrayBuffer) return onVideo(e.data);
+    const msg = JSON.parse(e.data);
+    if (msg.t === 'ime') { hostIme = msg.error ? '切替失敗' : msg.on ? 'あ' : 'A'; showStats(); }
+  };
   ws.onclose = e => {
     if (e.code === 4000) { setState('別の画面から接続されたため切断しました（再接続で取り戻せます）'); return; }
     setState(`切断（${retryMs / 1000}秒後に再接続）`);
@@ -129,6 +135,7 @@ function showStats() {
     `ビットレート ${(stats.bytes * 8 / secs / 1000).toFixed(0)} kbps`,
     `デコード待ち ${decoder ? decoder.decodeQueueSize : '-'}`,
     `キャプチャ→表示 中央 ${q(0.5)} ms / p95 ${q(0.95)} ms`,
+    `ホストの IME ${hostIme}`,
   ].join('\n');
   if (secs > 2) stats = { frames: 0, bytes: 0, since: performance.now() };
 }
@@ -205,17 +212,24 @@ document.querySelectorAll('[data-key]').forEach(b => {
   b.onclick = () => send({ t: 'key', k: b.dataset.key, ctrl: !!b.dataset.ctrl });
 });
 
-// Physical keyboard, when the text box is not focused.
+document.getElementById('imeBtn').onclick = () => send({ t: 'imetoggle' });
+
+// Physical keyboard, when the text box is not focused. Characters go as key presses
+// ('type'), so with the host's IME on (半角/全角) they are composed into Japanese there.
 const NAMED = new Set(['Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown',
   'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
+// What browsers report for the 半角/全角 key (key names differ; keyCode 243/244 on Windows).
+const IME_TOGGLE_KEYS = new Set(['Zenkaku', 'Hankaku', 'ZenkakuHankaku', 'KanjiMode']);
 document.addEventListener('keydown', e => {
   if (document.activeElement === textBox || e.isComposing || e.altKey || e.metaKey) return;
-  if (e.ctrlKey && e.key.length === 1 && 'acvxzy'.includes(e.key.toLowerCase())) {
+  if (IME_TOGGLE_KEYS.has(e.key) || e.keyCode === 243 || e.keyCode === 244) {
+    send({ t: 'imetoggle' });
+  } else if (e.ctrlKey && e.key.length === 1 && 'acvxzy'.includes(e.key.toLowerCase())) {
     send({ t: 'key', k: e.key.toLowerCase(), ctrl: true });
   } else if (NAMED.has(e.key)) {
     send({ t: 'key', k: e.key, ctrl: e.ctrlKey, shift: e.shiftKey });
   } else if (e.key.length === 1 && !e.ctrlKey) {
-    send({ t: 'text', s: e.key });
+    send({ t: 'type', c: e.key });
   } else {
     return;
   }

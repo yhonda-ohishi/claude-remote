@@ -5,7 +5,8 @@
 //!   of another app lying on top of it never receives remote clicks;
 //! - keys are sent only while the Claude app is the foreground window;
 //! - only a fixed set of keys is accepted. Alt and Win are never sent, so shortcuts that leave
-//!   the app (Win+R, Alt+Tab, ...) cannot be produced.
+//!   the app (Win+R, Alt+Tab, ...) cannot be produced. Printable characters are pressed as
+//!   plain keys (at most with Shift) so the host's IME can compose Japanese from them.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_BACK,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetCursorPos, GetForegroundWindow, GetWindow, SendMessageTimeoutW, SetCursorPos,
@@ -41,6 +42,11 @@ pub enum InputMsg {
     Text { s: String },
     /// A named key (DOM `KeyboardEvent.key`) with optional Ctrl / Shift.
     Key { k: String, #[serde(default)] ctrl: bool, #[serde(default)] shift: bool },
+    /// One printable character typed on the viewer's keyboard. Sent as a real key press on the
+    /// host's layout (not as Unicode) so that the host's IME can compose it, e.g. romaji.
+    Type { c: String },
+    /// Switch the host's IME on or off (the viewer's 半角/全角 key).
+    ImeToggle,
 }
 
 pub struct Injector {
@@ -147,7 +153,43 @@ impl Injector {
                 self.ensure_foreground()?;
                 send(&key_combo(vk, ctrl, shift))
             }
+            InputMsg::Type { c } => {
+                let mut chars = c.chars();
+                let (Some(ch), None) = (chars.next(), chars.next()) else {
+                    return Err("not a single character");
+                };
+                if ch.is_control() {
+                    return Err("control character");
+                }
+                self.ensure_foreground()?;
+                match key_for_char(ch) {
+                    Some((vk, shift)) => send(&key_combo(vk, false, shift)),
+                    // Not on the host's keyboard layout: type it as Unicode instead.
+                    None => {
+                        let mut buf = [0u16; 2];
+                        let events: Vec<INPUT> = ch
+                            .encode_utf16(&mut buf)
+                            .iter()
+                            .flat_map(|&u| [unicode(u, KEYBD_EVENT_FLAGS(0)), unicode(u, KEYEVENTF_KEYUP)])
+                            .collect();
+                        send(&events)
+                    }
+                }
+            }
+            InputMsg::ImeToggle => self.toggle_ime().map(|_| ()),
         }
+    }
+
+    /// Switch the Claude app's IME on or off. Returns whether it is now on.
+    pub fn toggle_ime(&self) -> Result<bool, &'static str> {
+        self.ensure_foreground()?;
+        let ime_window = unsafe { ImmGetDefaultIMEWnd(GetForegroundWindow()) };
+        if ime_window.is_invalid() {
+            return Err("no IME for the window");
+        }
+        let open = ime_control(ime_window, IMC_GETOPENSTATUS, 0).ok_or("IME did not answer")? != 0;
+        ime_control(ime_window, IMC_SETOPENSTATUS, (!open) as isize).ok_or("IME did not answer")?;
+        Ok(!open)
     }
 
     /// Normalized window coordinates to physical screen pixels. Off-window points are rejected.
@@ -218,18 +260,18 @@ struct ImeOff {
     was_open: bool,
 }
 
-impl ImeOff {
-    const IMC_GETOPENSTATUS: usize = 0x0005;
-    const IMC_SETOPENSTATUS: usize = 0x0006;
+const IMC_GETOPENSTATUS: usize = 0x0005;
+const IMC_SETOPENSTATUS: usize = 0x0006;
 
+impl ImeOff {
     fn new(target: HWND) -> Option<Self> {
         let ime_window = unsafe { ImmGetDefaultIMEWnd(target) };
         if ime_window.is_invalid() {
             return None;
         }
-        let was_open = ime_control(ime_window, Self::IMC_GETOPENSTATUS, 0)? != 0;
+        let was_open = ime_control(ime_window, IMC_GETOPENSTATUS, 0)? != 0;
         if was_open {
-            ime_control(ime_window, Self::IMC_SETOPENSTATUS, 0)?;
+            ime_control(ime_window, IMC_SETOPENSTATUS, 0)?;
         }
         Some(Self { ime_window, was_open })
     }
@@ -238,9 +280,22 @@ impl ImeOff {
 impl Drop for ImeOff {
     fn drop(&mut self) {
         if self.was_open {
-            let _ = ime_control(self.ime_window, Self::IMC_SETOPENSTATUS, 1);
+            let _ = ime_control(self.ime_window, IMC_SETOPENSTATUS, 1);
         }
     }
+}
+
+/// The key (and whether Shift is needed) that produces `ch` on the host's keyboard layout.
+/// None for characters that need Ctrl/Alt or are not on the layout.
+fn key_for_char(ch: char) -> Option<(VIRTUAL_KEY, bool)> {
+    let unit = u16::try_from(ch as u32).ok()?;
+    let scan = unsafe { VkKeyScanW(unit) };
+    if scan == -1 {
+        return None;
+    }
+    let (vk, mods) = ((scan as u16) & 0xff, ((scan as u16) >> 8) & 0xff);
+    // Bit 0 = Shift; anything else (Ctrl, Alt, Hankaku) is not something we send.
+    (mods & !1 == 0).then_some((VIRTUAL_KEY(vk), mods & 1 != 0))
 }
 
 /// `WM_IME_CONTROL` with a timeout, so a hung app cannot stall the viewer's session.
