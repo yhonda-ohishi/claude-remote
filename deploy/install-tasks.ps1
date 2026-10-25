@@ -23,16 +23,23 @@ Copy-Item (Join-Path $PSScriptRoot 'run.ps1') (Join-Path $InstallDir 'run.ps1') 
 
 $user = "$env:USERDOMAIN\$env:USERNAME"
 foreach ($what in 'host', 'tunnel') {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$InstallDir\run.ps1`" $what" `
+    # A headless console of its own: no window, and console signals (Ctrl+C / close) sent to
+    # other consoles cannot reach it. A hidden powershell window was once taken down this way.
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' `
+        -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\run.ps1`" $what" `
         -WorkingDirectory $InstallDir
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    # At logon, and every 5 minutes as a watchdog: with IgnoreNew a running instance is left
+    # alone, and one that died is started again. (RestartCount only covers failures to start.)
+    $triggers = @(
+        (New-ScheduledTaskTrigger -AtLogOn -User $user),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
+    )
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName "claude-remote-$what" -Description "claude-remote: keeps $what running (see $InstallDir\run.ps1)" `
-        -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+        -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
     Start-ScheduledTask -TaskName "claude-remote-$what"
     "registered and started claude-remote-$what"
 }
