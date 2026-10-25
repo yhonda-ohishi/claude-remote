@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Remote</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  canvas { position: fixed; left: 0; right: 0; top: 0; bottom: 96px; width: 100%; height: calc(100% - 96px);
+           object-fit: contain; background: #000; outline: none; }
+  #hud { position: fixed; left: 8px; top: 8px; padding: 6px 8px; background: rgba(0,0,0,.65);
+         border-radius: 6px; white-space: pre; font: 12px/1.35 ui-monospace, Consolas, monospace; pointer-events: none; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+         background: #1b1b1b; border-top: 1px solid #333; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  #text { flex: 1; min-width: 0; background: #000; color: #eee; border: 1px solid #555; border-radius: 6px;
+          padding: 6px 8px; font: inherit; font-size: 15px; }
+  button { background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 10px; font: inherit; }
+  .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<canvas id="screen" tabindex="0"></canvas>
+<div id="hud">接続中…</div>
+<div id="bar">
+  <div class="row">
+    <input id="text" placeholder="ここに入力して「送信」（日本語はこの欄で確定）" autocomplete="off">
+    <button id="sendText">送信</button>
+  </div>
+  <div class="row">
+    <button data-key="Enter">Enter</button>
+    <button data-key="Enter" data-ctrl="1">Ctrl+Enter</button>
+    <button data-key="Escape">Esc</button>
+    <button data-key="Tab">Tab</button>
+    <button data-key="Backspace">⌫</button>
+    <span class="spacer"></span>
+    <button id="reconnect">再接続</button>
+  </div>
+</div>
+<script>
+const screen = document.getElementById('screen');
+const ctx = screen.getContext('2d');
+const hud = document.getElementById('hud');
+
+// ---- Connection and video --------------------------------------------------------------------
+// One WebSocket carries everything, so the page works through Cloudflare Tunnel (HTTP/TCP only).
+// Video messages: [1][keyframe u8][captured unix ms f64 LE][H.264 Annex B].
+
+let ws, decoder, configured = false, state = '接続中', retryMs = 1000, retryTimer;
+let stats = { frames: 0, bytes: 0, since: performance.now() }, latencies = [];
+
+function connect() {
+  clearTimeout(retryTimer);
+  if (ws) { ws.onclose = null; ws.close(); }
+  resetDecoder();
+  setState('接続中');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setState('接続済み'); retryMs = 1000; };
+  ws.onmessage = e => { if (e.data instanceof ArrayBuffer) onVideo(e.data); };
+  ws.onclose = e => {
+    if (e.code === 4000) { setState('別の画面から接続されたため切断しました（再接続で取り戻せます）'); return; }
+    setState(`切断（${retryMs / 1000}秒後に再接続）`);
+    retryTimer = setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 30000);
+  };
+}
+
+function resetDecoder() {
+  if (decoder && decoder.state !== 'closed') decoder.close();
+  configured = false;
+  decoder = new VideoDecoder({
+    output: frame => {
+      if (screen.width !== frame.displayWidth || screen.height !== frame.displayHeight) {
+        screen.width = frame.displayWidth; screen.height = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0);
+      latencies.push(Date.now() - frame.timestamp / 1000);
+      if (latencies.length > 120) latencies.shift();
+      frame.close();
+    },
+    error: e => {
+      // Broken stream: start over from a fresh keyframe.
+      setState('デコードエラー: ' + e.message);
+      resetDecoder();
+      send({ t: 'keyframe' });
+    },
+  });
+}
+
+function onVideo(buf) {
+  const view = new DataView(buf);
+  if (view.getUint8(0) !== 1) return;
+  const keyframe = view.getUint8(1) === 1;
+  const captured = view.getFloat64(2, true);
+  const data = new Uint8Array(buf, 10);
+  stats.frames++; stats.bytes += buf.byteLength;
+  if (!configured) {
+    if (!keyframe) return;
+    decoder.configure({ codec: codecString(data), optimizeForLatency: true });
+    configured = true;
+  }
+  // Skip work rather than queue it if decoding falls behind.
+  if (decoder.decodeQueueSize > 2 && !keyframe) return;
+  decoder.decode(new EncodedVideoChunk({ type: keyframe ? 'key' : 'delta', timestamp: captured * 1000, data }));
+}
+
+// avc1.PPCCLL from the SPS (NAL type 7) in the keyframe.
+function codecString(d) {
+  for (let i = 0; i + 4 < d.length; i++) {
+    if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1 && (d[i + 3] & 0x1f) === 7) {
+      const hex = b => b.toString(16).padStart(2, '0');
+      return 'avc1.' + hex(d[i + 4]) + hex(d[i + 5]) + hex(d[i + 6]);
+    }
+  }
+  return 'avc1.42e01f';
+}
+
+function setState(s) { state = s; showStats(); }
+
+function showStats() {
+  const secs = (performance.now() - stats.since) / 1000;
+  const sorted = [...latencies].sort((a, b) => a - b);
+  const q = p => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))].toFixed(0) : '-';
+  hud.textContent = [
+    `状態     ${state}`,
+    `解像度   ${screen.width}x${screen.height}  ${(stats.frames / secs).toFixed(1)} fps`,
+    `ビットレート ${(stats.bytes * 8 / secs / 1000).toFixed(0)} kbps`,
+    `デコード待ち ${decoder ? decoder.decodeQueueSize : '-'}`,
+    `キャプチャ→表示 中央 ${q(0.5)} ms / p95 ${q(0.95)} ms`,
+  ].join('\n');
+  if (secs > 2) stats = { frames: 0, bytes: 0, since: performance.now() };
+}
+setInterval(showStats, 1000);
+
+document.getElementById('reconnect').onclick = () => { retryMs = 1000; connect(); };
+if (!('VideoDecoder' in window)) {
+  hud.textContent = 'このブラウザでは WebCodecs が使えません（HTTPS か localhost で開いてください）';
+} else {
+  connect();
+}
+
+// ---- Input -----------------------------------------------------------------------------------
+
+function send(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// Map a client point to normalized window coordinates, accounting for letterboxing
+// (object-fit: contain). Returns null outside the picture.
+function toWindow(clientX, clientY) {
+  const r = screen.getBoundingClientRect();
+  if (!screen.width) return null;
+  const scale = Math.min(r.width / screen.width, r.height / screen.height);
+  const w = screen.width * scale, h = screen.height * scale;
+  const x = (clientX - r.left - (r.width - w) / 2) / w;
+  const y = (clientY - r.top - (r.height - h) / 2) / h;
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? { x, y } : null;
+}
+
+// Mouse: moves coalesced to one per animation frame.
+let pendingMove = null;
+screen.addEventListener('pointermove', e => {
+  const p = toWindow(e.clientX, e.clientY);
+  if (!p) return;
+  if (!pendingMove) requestAnimationFrame(() => { send({ t: 'move', ...pendingMove }); pendingMove = null; });
+  pendingMove = p;
+});
+screen.addEventListener('pointerdown', e => {
+  const p = toWindow(e.clientX, e.clientY);
+  if (!p) return;
+  screen.focus();
+  screen.setPointerCapture(e.pointerId);
+  send({ t: 'down', b: e.button, ...p });
+  e.preventDefault();
+});
+screen.addEventListener('pointerup', e => {
+  const r = screen.getBoundingClientRect();
+  const p = toWindow(Math.min(Math.max(e.clientX, r.left), r.right), Math.min(Math.max(e.clientY, r.top), r.bottom))
+    || { x: 0.5, y: 0.5 };
+  send({ t: 'up', b: e.button, ...p });
+});
+screen.addEventListener('wheel', e => {
+  const p = toWindow(e.clientX, e.clientY);
+  if (!p) return;
+  const k = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1;  // lines / pages to px
+  send({ t: 'wheel', dx: e.deltaX * k, dy: e.deltaY * k, ...p });
+  e.preventDefault();
+}, { passive: false });
+screen.addEventListener('contextmenu', e => e.preventDefault());
+
+// Text: typed into the box (the IME finishes composition there), then sent as a string.
+const textBox = document.getElementById('text');
+function sendText() {
+  if (!textBox.value) return;
+  send({ t: 'text', s: textBox.value });
+  textBox.value = '';
+}
+document.getElementById('sendText').onclick = sendText;
+textBox.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); sendText(); }
+});
+document.querySelectorAll('[data-key]').forEach(b => {
+  b.onclick = () => send({ t: 'key', k: b.dataset.key, ctrl: !!b.dataset.ctrl });
+});
+
+// Physical keyboard, when the text box is not focused.
+const NAMED = new Set(['Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown',
+  'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
+document.addEventListener('keydown', e => {
+  if (document.activeElement === textBox || e.isComposing || e.altKey || e.metaKey) return;
+  if (e.ctrlKey && e.key.length === 1 && 'acvxzy'.includes(e.key.toLowerCase())) {
+    send({ t: 'key', k: e.key.toLowerCase(), ctrl: true });
+  } else if (NAMED.has(e.key)) {
+    send({ t: 'key', k: e.key, ctrl: e.ctrlKey, shift: e.shiftKey });
+  } else if (e.key.length === 1 && !e.ctrlKey) {
+    send({ t: 'text', s: e.key });
+  } else {
+    return;
+  }
+  e.preventDefault();
+});
+</script>
+</body>
+</html>

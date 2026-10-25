@@ -1,0 +1,21 @@
+# cloudflared config for claude-remote-host.
+# Copy to C:\Users\<you>\.cloudflared\claude-remote.yml and fill in the <...> values.
+#
+# claude-remote-host has no authentication of its own and listens on 127.0.0.1 only.
+# All outside access goes through this tunnel, and only after Cloudflare Access lets it in.
+
+tunnel: <TUNNEL_ID>
+credentials-file: C:\Users\<you>\.cloudflared\<TUNNEL_ID>.json
+
+ingress:
+  - hostname: <HOSTNAME>
+    service: http://127.0.0.1:8080
+    originRequest:
+      # Defense in depth: cloudflared itself rejects requests that do not carry a valid
+      # Access token for this application, even if the Access app is misconfigured or removed.
+      access:
+        required: true
+        teamName: <ZERO_TRUST_TEAM_NAME>
+        audTag:
+          - <ACCESS_APP_AUD>
+  - service: http_status:404

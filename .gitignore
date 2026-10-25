@@ -1,0 +1,5 @@
+/target
+# Machine-specific build settings (e.g. a short target-dir to dodge MAX_PATH).
+/.cargo/
+# Probe output: screenshots of the desktop.
+captures/
