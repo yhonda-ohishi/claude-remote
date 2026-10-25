@@ -8,9 +8,11 @@
 //!   the app (Win+R, Alt+Tab, ...) cannot be produced.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Deserialize;
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -21,8 +23,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetForegroundWindow, GetWindow, SetCursorPos, SetForegroundWindow,
-    WindowFromPoint, GA_ROOT, GW_OWNER,
+    GetAncestor, GetCursorPos, GetForegroundWindow, GetWindow, SendMessageTimeoutW, SetCursorPos,
+    SetForegroundWindow, WindowFromPoint, GA_ROOT, GW_OWNER, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
 };
 
 /// One input event from the browser. Coordinates are normalized to the window (0..1).
@@ -121,6 +123,9 @@ impl Injector {
             }
             InputMsg::Text { s } => {
                 self.ensure_foreground()?;
+                // The text was already composed by the viewer's IME. If the host's IME is on,
+                // it would take the injected characters as reading and convert them again.
+                let _ime_off = ImeOff::new(unsafe { GetForegroundWindow() });
                 let mut events = Vec::new();
                 for unit in s.encode_utf16() {
                     if unit == '\n' as u16 {
@@ -131,7 +136,11 @@ impl Injector {
                         events.push(unicode(unit, KEYEVENTF_KEYUP));
                     }
                 }
-                send(&events)
+                let result = send(&events);
+                // SendInput only queues the events; let the app consume them before the IME
+                // is switched back on (when `_ime_off` drops).
+                std::thread::sleep(Duration::from_millis((50 + 2 * events.len() as u64).min(2000)));
+                result
             }
             InputMsg::Key { k, ctrl, shift } => {
                 let vk = allowed_key(&k, ctrl).ok_or("key not allowed")?;
@@ -200,6 +209,55 @@ impl Injector {
         }
         false
     }
+}
+
+/// Turns the IME of a window off for as long as it lives, then restores it if it was on.
+/// Works across processes by messaging the window's default IME window.
+struct ImeOff {
+    ime_window: HWND,
+    was_open: bool,
+}
+
+impl ImeOff {
+    const IMC_GETOPENSTATUS: usize = 0x0005;
+    const IMC_SETOPENSTATUS: usize = 0x0006;
+
+    fn new(target: HWND) -> Option<Self> {
+        let ime_window = unsafe { ImmGetDefaultIMEWnd(target) };
+        if ime_window.is_invalid() {
+            return None;
+        }
+        let was_open = ime_control(ime_window, Self::IMC_GETOPENSTATUS, 0)? != 0;
+        if was_open {
+            ime_control(ime_window, Self::IMC_SETOPENSTATUS, 0)?;
+        }
+        Some(Self { ime_window, was_open })
+    }
+}
+
+impl Drop for ImeOff {
+    fn drop(&mut self) {
+        if self.was_open {
+            let _ = ime_control(self.ime_window, Self::IMC_SETOPENSTATUS, 1);
+        }
+    }
+}
+
+/// `WM_IME_CONTROL` with a timeout, so a hung app cannot stall the viewer's session.
+fn ime_control(ime_window: HWND, command: usize, value: isize) -> Option<usize> {
+    let mut result = 0usize;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            ime_window,
+            WM_IME_CONTROL,
+            WPARAM(command),
+            LPARAM(value),
+            SMTO_ABORTIFHUNG,
+            200,
+            Some(&mut result),
+        )
+    };
+    (ok.0 != 0).then_some(result)
 }
 
 /// Keys the client may send. Ctrl is only allowed for send / editing shortcuts inside the app.
