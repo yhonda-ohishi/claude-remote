@@ -215,9 +215,18 @@ impl Injector {
     /// Move the cursor to the point and make sure what is under it belongs to the Claude app.
     fn point_on_claude(&self, x: f64, y: f64) -> Result<(), &'static str> {
         let p = self.to_screen(x, y)?;
-        let root = unsafe { GetAncestor(WindowFromPoint(p), GA_ROOT) };
-        if !self.is_claude(root) {
-            return Err("another window is on top at that point");
+        let covered = |p: POINT| !self.is_claude(unsafe { GetAncestor(WindowFromPoint(p), GA_ROOT) });
+        if covered(p) {
+            // The viewer only sees the Claude window, so it cannot tell another window is on top
+            // (e.g. after the host's resolution changed). Bring Claude to the front instead of
+            // dropping the click; the other window itself is still never clicked.
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd());
+            }
+            std::thread::sleep(Duration::from_millis(80));
+            if covered(p) {
+                return Err("another window is on top at that point");
+            }
         }
         unsafe { SetCursorPos(p.x, p.y).map_err(|_| "SetCursorPos failed") }
     }
@@ -238,19 +247,34 @@ impl Injector {
 
     /// The main window, or a window it owns (dialogs such as the file picker).
     fn is_claude(&self, hwnd: HWND) -> bool {
-        let main = self.hwnd();
-        let mut h = hwnd;
-        for _ in 0..4 {
-            if h == main {
-                return true;
-            }
-            match unsafe { GetWindow(h, GW_OWNER) } {
-                Ok(owner) if !owner.is_invalid() => h = owner,
-                _ => return false,
-            }
-        }
-        false
+        owned_by(hwnd, self.hwnd())
     }
+}
+
+/// `hwnd` is `main` or a window owned by it (directly or a few levels down).
+fn owned_by(hwnd: HWND, main: HWND) -> bool {
+    let mut h = hwnd;
+    for _ in 0..4 {
+        if h == main {
+            return true;
+        }
+        match unsafe { GetWindow(h, GW_OWNER) } {
+            Ok(owner) if !owner.is_invalid() => h = owner,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether the Claude window (or a dialog it owns) is in the foreground with its IME on, i.e.
+/// whether the IME candidate list can be showing over it.
+pub fn ime_open_in_foreground(main: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    if !owned_by(foreground, main) {
+        return false;
+    }
+    let ime_window = unsafe { ImmGetDefaultIMEWnd(foreground) };
+    !ime_window.is_invalid() && ime_control(ime_window, IMC_GETOPENSTATUS, 0).is_some_and(|open| open != 0)
 }
 
 /// Turns the IME of a window off for as long as it lives, then restores it if it was on.

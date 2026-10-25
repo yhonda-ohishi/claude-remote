@@ -15,11 +15,13 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
 
-use claude_remote_probe::capture::{BgraFrame, Capturer};
+use claude_remote_probe::capture::{BgraFrame, Capturer, FrameStream};
 use claude_remote_probe::encoder::H264Encoder;
-use claude_remote_probe::input::Injector;
-use claude_remote_probe::windows_enum::{find_windows, is_claude_app, pick_main};
+use claude_remote_probe::input::{ime_open_in_foreground, Injector};
+use claude_remote_probe::windows_enum::{find_windows, frame_bounds, is_claude_app, monitor_of, pick_main};
 use claude_remote_probe::ws::{serve, EncodedFrame, Hub};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 
@@ -73,7 +75,7 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
-    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut _);
+    let hwnd = HWND(hwnd as *mut _);
     let capturer = Capturer::new()?;
     let mut stream = capturer.stream(hwnd)?;
     let frame_interval = Duration::from_secs_f32(1.0 / fps);
@@ -82,22 +84,39 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
     let mut encoder: Option<H264Encoder> = None;
     let mut last_sent = Instant::now();
     let mut stats = Stats::new();
+    let mut screen = ScreenView::new();
 
     loop {
         // Wait briefly when a keyframe is owed so a new viewer doesn't stare at black.
         let wait = if hub.keyframe_pending() { Duration::from_millis(50) } else { Duration::from_secs(1) };
-        let arrived = stream.latest(&capturer, wait);
-        let fresh = arrived.is_some();
-        let captured_at = match arrived {
-            Some((frame, at)) => {
+        // With the IME on in the Claude window its candidate list can be up. Windows 11 draws
+        // that list above all windows, out of reach of window capture, so meanwhile the picture
+        // is cut out of the monitor at the Claude window's position instead.
+        let from_screen = ime_open_in_foreground(hwnd);
+        let mut fresh = from_screen != screen.active();
+
+        let captured_at = if from_screen {
+            let at = screen.next(&capturer, hwnd, wait);
+            // Keep following the window too, so its picture is current when the IME goes off.
+            if let Some((frame, _)) = stream.latest(&capturer, Duration::ZERO) {
                 last = Some(capturer.read_bgra(&frame)?);
-                at
             }
-            // No change on screen: resend the last picture as a keepalive.
-            None => Instant::now(),
+            fresh |= at.is_some();
+            at.unwrap_or_else(Instant::now)
+        } else {
+            screen.stop();
+            match stream.latest(&capturer, wait) {
+                Some((frame, at)) => {
+                    last = Some(capturer.read_bgra(&frame)?);
+                    fresh = true;
+                    at
+                }
+                // No change on screen: resend the last picture as a keepalive.
+                None => Instant::now(),
+            }
         };
 
-        let Some(bgra) = last.as_ref() else { continue };
+        let Some(bgra) = screen.picture().or(last.as_ref()) else { continue };
         if !hub.has_subscriber() {
             encoder = None;
             continue;
@@ -141,6 +160,56 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
         }
         last_sent = Instant::now();
         stats.report_every(Duration::from_secs(2));
+    }
+}
+
+/// Capture of the monitor the Claude window is on, cropped to the Claude window. Used only while
+/// the Claude window has the IME on and is in the foreground, so that the IME candidate list
+/// shows. Anything else lying over the Claude window would show too, which is why window
+/// capture stays the default.
+struct ScreenView {
+    stream: Option<(HMONITOR, FrameStream)>,
+    picture: Option<BgraFrame>,
+}
+
+impl ScreenView {
+    fn new() -> Self {
+        Self { stream: None, picture: None }
+    }
+
+    fn active(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn picture(&self) -> Option<&BgraFrame> {
+        self.picture.as_ref()
+    }
+
+    /// Wait up to `wait` for the screen to change and crop the new picture. Returns its capture
+    /// time, or None if nothing changed (or the monitor cannot be captured).
+    fn next(&mut self, capturer: &Capturer, claude: HWND, wait: Duration) -> Option<Instant> {
+        let (monitor, monitor_rect) = monitor_of(claude)?;
+        if self.stream.as_ref().map(|(m, _)| *m) != Some(monitor) {
+            match capturer.stream_monitor(monitor) {
+                Ok(stream) => self.stream = Some((monitor, stream)),
+                Err(e) => {
+                    eprintln!("monitor capture unavailable: {e}");
+                    return None;
+                }
+            }
+        }
+        let (_, stream) = self.stream.as_mut()?;
+        let (frame, at) = stream.latest(capturer, wait)?;
+        let full = capturer.read_bgra(&frame).ok()?;
+        let c = frame_bounds(claude)?;
+        let (x, y) = (c[0] - monitor_rect[0], c[1] - monitor_rect[1]);
+        self.picture = Some(full.crop(x, y, (c[2] - c[0]) as u32, (c[3] - c[1]) as u32)?);
+        Some(at)
+    }
+
+    fn stop(&mut self) {
+        self.stream = None;
+        self.picture = None;
     }
 }
 

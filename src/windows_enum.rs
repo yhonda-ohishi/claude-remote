@@ -6,6 +6,9 @@ use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -124,6 +127,30 @@ pub fn describe(hwnd: HWND, pid: u32, exe: String) -> WindowInfo {
             dpi: GetDpiForWindow(hwnd),
         }
     }
+}
+
+/// The monitor the window is on, with its rectangle (physical pixels): left, top, right, bottom.
+pub fn monitor_of(hwnd: HWND) -> Option<(HMONITOR, [i32; 4])> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        GetMonitorInfoW(monitor, &mut info).as_bool().then(|| (monitor, rect_array(info.rcMonitor)))
+    }
+}
+
+/// DWM frame bounds (physical pixels): left, top, right, bottom.
+pub fn frame_bounds(hwnd: HWND) -> Option<[i32; 4]> {
+    let mut r = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut r as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()?;
+    }
+    Some(rect_array(r))
 }
 
 /// The main window: the largest capturable unowned window with a title.

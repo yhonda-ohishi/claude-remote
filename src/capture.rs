@@ -1,4 +1,4 @@
-//! One-shot window capture with Windows.Graphics.Capture.
+//! Window and monitor capture with Windows.Graphics.Capture.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
 use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -145,10 +146,22 @@ impl Capturer {
         Ok(image)
     }
 
-    /// Start a capture session that keeps delivering frames until the stream is dropped.
+    /// Start a capture session on a window that keeps delivering frames until the stream is dropped.
     pub fn stream(&self, hwnd: HWND) -> Result<FrameStream> {
         let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
         let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+        self.stream_item(&item)
+    }
+
+    /// The same for a whole monitor. Unlike window capture this also shows UI that Windows draws
+    /// above all windows, such as the Windows 11 IME candidate list.
+    pub fn stream_monitor(&self, monitor: HMONITOR) -> Result<FrameStream> {
+        let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor)? };
+        self.stream_item(&item)
+    }
+
+    fn stream_item(&self, item: &GraphicsCaptureItem) -> Result<FrameStream> {
         let size = item.Size()?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &self.device,
@@ -156,7 +169,7 @@ impl Capturer {
             2,
             size,
         )?;
-        let session = pool.CreateCaptureSession(&item)?;
+        let session = pool.CreateCaptureSession(item)?;
         if self.borderless {
             let _ = session.SetIsBorderRequired(false);
         }
@@ -216,10 +229,30 @@ impl Capturer {
     }
 }
 
+#[derive(Clone)]
 pub struct BgraFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+impl BgraFrame {
+    /// The `width` x `height` region at (`x`, `y`), clamped to this frame. None if it is empty.
+    pub fn crop(&self, x: i32, y: i32, width: u32, height: u32) -> Option<BgraFrame> {
+        let x0 = x.clamp(0, self.width as i32) as usize;
+        let y0 = y.clamp(0, self.height as i32) as usize;
+        let x1 = (x + width as i32).clamp(0, self.width as i32) as usize;
+        let y1 = (y + height as i32).clamp(0, self.height as i32) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        let stride = self.width as usize * 4;
+        let mut data = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
+        for row in y0..y1 {
+            data.extend_from_slice(&self.data[row * stride + x0 * 4..row * stride + x1 * 4]);
+        }
+        Some(BgraFrame { data, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
+    }
 }
 
 /// A running capture session. Frames arrive only when the window's content changes.
