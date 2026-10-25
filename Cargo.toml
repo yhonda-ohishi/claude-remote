@@ -2,6 +2,7 @@
 name = "claude-remote-probe"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "View and operate the Claude desktop app's window from another PC's browser (Windows host)"
 
 [dependencies]

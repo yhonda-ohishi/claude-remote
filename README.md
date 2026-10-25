@@ -74,3 +74,7 @@ powershell -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -HostExe targe
 - PC はログオンしたまま、ロックせずに動かす必要がある。ロック画面と UAC の画面はキャプチャも操作もできない
 - 1920x1152 のままソフトウェアでエンコードしているので、30 fps には届かない。表示サイズへの縮小や HW エンコーダーは未対応
 - 受信できるのは同時に1台だけ。新しい接続が来ると、前の接続はコード 4000 で閉じられる
+
+## ライセンス
+
+MIT（[LICENSE](LICENSE)）。
