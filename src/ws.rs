@@ -38,9 +38,19 @@ pub struct Hub {
     current: Mutex<Option<(u64, Sender<Arc<EncodedFrame>>)>>,
     next_id: AtomicU64,
     keyframe: AtomicBool,
+    /// The current viewer's display area in device pixels; frames are scaled down to fit it.
+    viewport: Mutex<Option<(u32, u32)>>,
 }
 
 impl Hub {
+    pub fn viewport(&self) -> Option<(u32, u32)> {
+        *self.viewport.lock().unwrap()
+    }
+
+    fn set_viewport(&self, size: Option<(u32, u32)>) {
+        *self.viewport.lock().unwrap() = size;
+    }
+
     pub fn has_subscriber(&self) -> bool {
         self.current.lock().unwrap().is_some()
     }
@@ -77,6 +87,8 @@ impl Hub {
         let mut current = self.current.lock().unwrap();
         if matches!(current.as_ref(), Some((c, _)) if *c == id) {
             *current = None;
+            // The next viewer reports its own size; until then send full size.
+            self.set_viewport(None);
         }
     }
 }
@@ -229,6 +241,18 @@ fn pack(frame: &EncodedFrame) -> Vec<u8> {
 fn handle_text(hub: &Hub, injector: &Injector, text: &str, same_pc: bool, id: u64) -> Option<String> {
     if text.contains("\"t\":\"keyframe\"") {
         hub.request_keyframe();
+        return None;
+    }
+    if text.contains("\"t\":\"viewport\"") {
+        // {"t":"viewport","w":..,"h":..}: the viewer's display area in device pixels.
+        let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+        let size = (v["w"].as_u64(), v["h"].as_u64());
+        if let (Some(w), Some(h)) = size {
+            // Below this the picture is useless; keep a floor.
+            let size = ((w as u32).max(320), (h as u32).max(180));
+            hub.set_viewport(Some(size));
+            println!("[viewer {id}] viewport {}x{}", size.0, size.1);
+        }
         return None;
     }
     let msg: InputMsg = match serde_json::from_str(text) {

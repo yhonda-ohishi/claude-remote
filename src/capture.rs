@@ -253,6 +253,51 @@ impl BgraFrame {
         }
         Some(BgraFrame { data, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
     }
+
+    /// Scale down to `width` x `height` by averaging the source pixels each output pixel
+    /// covers (keeps text legible when shrinking). Never scales up.
+    pub fn downscale(&self, width: u32, height: u32) -> BgraFrame {
+        if width >= self.width && height >= self.height {
+            return self.clone();
+        }
+        let (sw, sh) = (self.width as usize, self.height as usize);
+        let (dw, dh) = (width.max(1) as usize, height.max(1) as usize);
+        let span = |i: usize, src: usize, dst: usize| {
+            let start = i * src / dst;
+            (start, ((i + 1) * src / dst).max(start + 1))
+        };
+        let columns: Vec<(usize, usize)> = (0..dw).map(|x| span(x, sw, dw)).collect();
+        let mut data = vec![0u8; dw * dh * 4];
+        for y in 0..dh {
+            let (y0, y1) = span(y, sh, dh);
+            for (x, &(x0, x1)) in columns.iter().enumerate() {
+                let mut sum = [0u32; 4];
+                for sy in y0..y1 {
+                    let row = &self.data[(sy * sw + x0) * 4..(sy * sw + x1) * 4];
+                    for px in row.chunks_exact(4) {
+                        for c in 0..4 {
+                            sum[c] += px[c] as u32;
+                        }
+                    }
+                }
+                let n = ((y1 - y0) * (x1 - x0)) as u32;
+                let out = &mut data[(y * dw + x) * 4..(y * dw + x) * 4 + 4];
+                for c in 0..4 {
+                    out[c] = (sum[c] / n) as u8;
+                }
+            }
+        }
+        BgraFrame { data, width: dw as u32, height: dh as u32 }
+    }
+}
+
+/// The largest size with the frame's aspect ratio that fits in `fit`, never larger than the
+/// frame itself, with even dimensions (H.264 4:2:0).
+pub fn fit_size(frame: (u32, u32), fit: (u32, u32)) -> (u32, u32) {
+    let scale = (fit.0 as f64 / frame.0 as f64).min(fit.1 as f64 / frame.1 as f64).min(1.0);
+    let w = ((frame.0 as f64 * scale).round() as u32).max(2) & !1;
+    let h = ((frame.1 as f64 * scale).round() as u32).max(2) & !1;
+    (w, h)
 }
 
 /// A running capture session. Frames arrive only when the window's content changes.

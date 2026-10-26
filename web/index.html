@@ -59,7 +59,7 @@ function connect() {
   setState('接続中');
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { setState('接続済み'); retryMs = 1000; };
+  ws.onopen = () => { setState('接続済み'); retryMs = 1000; sendViewport(); };
   ws.onmessage = e => {
     if (e.data instanceof ArrayBuffer) return onVideo(e.data);
     const msg = JSON.parse(e.data);
@@ -124,6 +124,15 @@ function codecString(d) {
 }
 
 function setState(s) { state = s; showStats(); }
+
+// Tell the host how many device pixels the picture can occupy, so it scales frames down to
+// that instead of sending (and encoding) more than this screen can show.
+function sendViewport() {
+  const r = screen.getBoundingClientRect();
+  send({ t: 'viewport', w: Math.round(r.width * devicePixelRatio), h: Math.round(r.height * devicePixelRatio) });
+}
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(sendViewport, 300); });
 
 function showStats() {
   const secs = (performance.now() - stats.since) / 1000;

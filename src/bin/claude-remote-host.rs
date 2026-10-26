@@ -9,13 +9,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    PROCESS_POWER_THROTTLING_STATE,
+};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
 
-use claude_remote_probe::capture::{BgraFrame, Capturer, FrameStream};
+use claude_remote_probe::capture::{fit_size, BgraFrame, Capturer, FrameStream};
 use claude_remote_probe::encoder::H264Encoder;
 use claude_remote_probe::input::{ime_open_in_foreground, Injector};
 use claude_remote_probe::windows_enum::{find_windows, frame_bounds, is_claude_app, monitor_of, pick_main};
@@ -37,6 +42,7 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    disable_power_throttling();
 
     let windows = find_windows(is_claude_app);
     let Some(main) = pick_main(&windows).map(|i| windows[i].clone()) else {
@@ -122,20 +128,31 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
             continue;
         }
 
+        // Send no more pixels than the viewer can show: fewer pixels is the cheapest way to make
+        // the software encoder faster.
+        let size = match hub.viewport() {
+            Some(viewport) => fit_size((bgra.width, bgra.height), viewport),
+            None => (bgra.width & !1, bgra.height & !1),
+        };
+
         let keyframe = hub.take_keyframe_request();
-        let encode_start = Instant::now();
         // A new encoder starts with an empty (green) picture, so it must load `last` before its
         // first encode even when no new frame arrived.
         let created = encoder.is_none();
         let enc = match encoder.as_mut() {
             Some(enc) => enc,
-            None => encoder.insert(
-                H264Encoder::new(bgra.width, bgra.height, bitrate, fps).expect("create H.264 encoder"),
-            ),
+            None => encoder.insert(H264Encoder::new(size.0, size.1, bitrate, fps).expect("create H.264 encoder")),
         };
-        let result = if fresh || created || enc.size() != (bgra.width & !1, bgra.height & !1) {
-            enc.encode(bgra, keyframe)
+        let mut scale_ms = 0.0;
+        let encode_start;
+        let result = if fresh || created || enc.size() != size {
+            let scale_start = Instant::now();
+            let scaled = (size != (bgra.width & !1, bgra.height & !1)).then(|| bgra.downscale(size.0, size.1));
+            scale_ms = scale_start.elapsed().as_secs_f64() * 1000.0;
+            encode_start = Instant::now();
+            enc.encode(scaled.as_ref().unwrap_or(bgra), keyframe)
         } else {
+            encode_start = Instant::now();
             enc.encode_last(keyframe)
         };
         let picture = match result {
@@ -149,7 +166,7 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
         };
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
         let age = captured_at.elapsed();
-        stats.add(picture.data.len(), encode_ms, age.as_secs_f64() * 1000.0, enc.size());
+        stats.add(picture.data.len(), scale_ms, encode_ms, age.as_secs_f64() * 1000.0, enc.size());
         let captured_unix_ms = (SystemTime::now() - age).duration_since(UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
         hub.publish(EncodedFrame { data: picture.data, keyframe: picture.keyframe, captured_unix_ms });
 
@@ -218,6 +235,7 @@ struct Stats {
     since: Instant,
     frames: u32,
     bytes: usize,
+    scale_ms: f64,
     encode_ms: f64,
     pipeline_ms: f64,
     size: (u32, u32),
@@ -225,12 +243,13 @@ struct Stats {
 
 impl Stats {
     fn new() -> Self {
-        Self { since: Instant::now(), frames: 0, bytes: 0, encode_ms: 0.0, pipeline_ms: 0.0, size: (0, 0) }
+        Self { since: Instant::now(), frames: 0, bytes: 0, scale_ms: 0.0, encode_ms: 0.0, pipeline_ms: 0.0, size: (0, 0) }
     }
 
-    fn add(&mut self, bytes: usize, encode_ms: f64, pipeline_ms: f64, size: (u32, u32)) {
+    fn add(&mut self, bytes: usize, scale_ms: f64, encode_ms: f64, pipeline_ms: f64, size: (u32, u32)) {
         self.frames += 1;
         self.bytes += bytes;
+        self.scale_ms += scale_ms;
         self.encode_ms += encode_ms;
         self.pipeline_ms += pipeline_ms;
         self.size = size;
@@ -244,15 +263,38 @@ impl Stats {
         let secs = elapsed.as_secs_f64();
         let n = self.frames as f64;
         println!(
-            "{}x{} {:.1} fps, encode {:.1} ms, capture->send {:.1} ms, {:.0} kbps",
+            "{}x{} {:.1} fps, scale {:.1} ms, encode {:.1} ms, capture->send {:.1} ms, {:.0} kbps",
             self.size.0,
             self.size.1,
             n / secs,
+            self.scale_ms / n,
             self.encode_ms / n,
             self.pipeline_ms / n,
             self.bytes as f64 * 8.0 / secs / 1000.0,
         );
         *self = Self::new();
+    }
+}
+
+/// Opt out of EcoQoS. Windows 11 runs windowless background processes, such as this host started
+/// by Task Scheduler in a headless console, on efficiency cores at low clocks, which made the
+/// software encoder about 3x slower than the same code run from a terminal.
+fn disable_power_throttling() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let result = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const _ as *const _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if let Err(e) = result {
+        eprintln!("could not opt out of power throttling: {e}");
     }
 }
 

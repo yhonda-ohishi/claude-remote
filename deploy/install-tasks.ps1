@@ -34,8 +34,10 @@ foreach ($what in 'host', 'tunnel') {
         (New-ScheduledTaskTrigger -AtLogOn -User $user),
         (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
     )
+    # Priority 4 = normal. The default (7) runs the task below normal priority, which made the
+    # software encoder 2-3x slower whenever other apps were busy.
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4 `
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName "claude-remote-$what" -Description "claude-remote: keeps $what running (see $InstallDir\run.ps1)" `
