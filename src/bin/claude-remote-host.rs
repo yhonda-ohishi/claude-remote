@@ -21,7 +21,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
 
 use claude_remote_probe::capture::{fit_size, BgraFrame, Capturer, FrameStream};
-use claude_remote_probe::encoder::H264Encoder;
+use claude_remote_probe::encoder::VideoEncoder;
 use claude_remote_probe::input::{ime_open_in_foreground, Injector};
 use claude_remote_probe::windows_enum::{find_windows, frame_bounds, is_claude_app, monitor_of, pick_main};
 use claude_remote_probe::ws::{serve, EncodedFrame, Hub};
@@ -87,7 +87,7 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
     let frame_interval = Duration::from_secs_f32(1.0 / fps);
 
     let mut last: Option<BgraFrame> = None;
-    let mut encoder: Option<H264Encoder> = None;
+    let mut encoder: Option<VideoEncoder> = None;
     let mut last_sent = Instant::now();
     let mut stats = Stats::new();
     let mut screen = ScreenView::new();
@@ -141,7 +141,17 @@ fn capture_loop(hwnd: usize, hub: &Hub, bitrate: u32, fps: f32) -> windows::core
         let created = encoder.is_none();
         let enc = match encoder.as_mut() {
             Some(enc) => enc,
-            None => encoder.insert(H264Encoder::new(size.0, size.1, bitrate, fps).expect("create H.264 encoder")),
+            None => match VideoEncoder::new(size.0, size.1, bitrate, fps) {
+                Ok(enc) => {
+                    println!("encoder: {} at {}x{}", enc.name(), size.0, size.1);
+                    encoder.insert(enc)
+                }
+                Err(e) => {
+                    eprintln!("cannot create an encoder: {e}");
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            },
         };
         let mut scale_ms = 0.0;
         let encode_start;

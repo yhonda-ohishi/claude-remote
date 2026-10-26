@@ -1,4 +1,5 @@
-//! H.264 encoding of captured BGRA frames with OpenH264 (software, screen-content mode).
+//! H.264 encoding of captured BGRA frames: the GPU encoder through Media Foundation when
+//! available ([`VideoEncoder`]), OpenH264 in software (screen-content mode) otherwise.
 
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType,
@@ -7,6 +8,60 @@ use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
 
 use crate::capture::BgraFrame;
+use crate::mf_encoder::MfEncoder;
+
+/// The encoder the host uses: the GPU's (Media Foundation) when there is one, else OpenH264.
+pub enum VideoEncoder {
+    Hardware(MfEncoder),
+    Software(H264Encoder),
+}
+
+impl VideoEncoder {
+    pub fn new(width: u32, height: u32, bitrate: u32, fps: f32) -> Result<Self, String> {
+        match MfEncoder::new(width, height, bitrate, fps.round() as u32) {
+            Ok(hw) => Ok(Self::Hardware(hw)),
+            Err(e) => {
+                eprintln!("hardware encoder unavailable ({e}); using OpenH264");
+                H264Encoder::new(width, height, bitrate, fps).map(Self::Software).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::Hardware(hw) => hw.name().to_string(),
+            Self::Software(_) => "OpenH264 (software)".into(),
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Hardware(hw) => hw.size(),
+            Self::Software(sw) => sw.size(),
+        }
+    }
+
+    /// Encode a new frame. A frame of another size gets a fresh encoder of the same kind.
+    pub fn encode(&mut self, frame: &BgraFrame, keyframe: bool) -> Result<Picture, String> {
+        match self {
+            Self::Hardware(hw) => {
+                if even(frame.width, frame.height) != hw.size() {
+                    *hw = MfEncoder::new(frame.width, frame.height, hw.bitrate(), hw.fps()).map_err(|e| e.to_string())?;
+                }
+                hw.encode(frame, keyframe).map_err(|e| e.to_string())
+            }
+            Self::Software(sw) => sw.encode(frame, keyframe).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Encode the previous frame again (keepalive while the window is static).
+    pub fn encode_last(&mut self, keyframe: bool) -> Result<Picture, String> {
+        match self {
+            Self::Hardware(hw) => hw.encode_last(keyframe).map_err(|e| e.to_string()),
+            Self::Software(sw) => sw.encode_last(keyframe).map_err(|e| e.to_string()),
+        }
+    }
+}
 
 /// One encoded access unit: Annex B NAL units (start-code delimited).
 pub struct Picture {

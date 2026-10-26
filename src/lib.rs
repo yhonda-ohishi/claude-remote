@@ -3,5 +3,6 @@
 pub mod capture;
 pub mod encoder;
 pub mod input;
+pub mod mf_encoder;
 pub mod ws;
 pub mod windows_enum;
